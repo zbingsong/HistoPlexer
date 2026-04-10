@@ -1,32 +1,15 @@
 import os 
-import cv2
-import numpy as np 
-import pandas as pd
 import openslide 
 import glob
 import argparse
 import time 
-import tqdm
-import tifffile
 import json
 from pathlib import Path
-import matplotlib.pyplot as plt
 from PIL import ImageDraw, Image
-from collections import OrderedDict
-
-import torch
-import torchvision
-import torch.nn as nnF
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
 from torchvision import transforms
-
 import torchstain
 from types import SimpleNamespace
 import json
-from shapely.geometry import Polygon, box
-from shapely.affinity import scale
-from shapely.ops import unary_union
 
 from src.inference.histoplexer_inference_wsi import HistoplexerInferenceWSI
 
@@ -64,7 +47,7 @@ print('protein_subset: ', len(protein_subset), protein_subset)
 chunk_size = args.chunk_size 
 chunk_padding = 0
 batch_size = args.batch_size
-loader_kwargs = {'num_workers': 8, 'pin_memory': True}
+loader_kwargs = {'num_workers': 2, 'pin_memory': False}
 
 # ----- prepare reference img for stain normalization -----
 normalizer = None
@@ -81,41 +64,33 @@ if args.ref_img_path:
 # ----- Initialize HistoplexerInferenceWSI -----
 histoplexer_wsi = HistoplexerInferenceWSI(
     checkpoint_path=args.checkpoint_path,
-    seg_level=6,  # Default segmentation level
+    seg_level=1,  # Default segmentation level
     chunk_size=chunk_size,
     batch_size=batch_size,
-    n_proteins=len(protein_subset),
+    protein_subset=protein_subset,
     loader_kwargs=loader_kwargs,
     device=args.device,
     normalizer=normalizer
 )
 
 # ----- get sample_roi names for a cv split from experiment config -----
-splits = pd.read_csv(config.split)
-if ("external_test" in data_set) or ('HE_ultivue' in data_set): 
-    samples = np.array(list(set([i.split('.')[0] for i in os.listdir(wsi_paths)])))
-elif "all" in data_set: # this includes cases that are tupro samples, even ones that are not in the cv split
-    samples = np.array(list(set([i.split('.')[0].split('-')[0].split('_')[0] for i in os.listdir(wsi_paths)]))) 
-    print(len(samples))    
-else:
-    sample_rois = list(set(splits[data_set].dropna()))   
-    # getting sample names from sample_rois
-    samples = np.array(list(set([i.split('_', 1)[0] for i in sample_rois]))) 
-
 if args.sample is None: 
+    samples = glob.glob(wsi_paths + '/*.svs')
     print('samples: ', samples)
-    save_path_imgs = save_path.joinpath(data_set + "_wsis")
+    
     for sample in samples: 
+        sample = sample.split('/')[-1].split('.svs')[0]
         print('sample: ', sample)
+        save_path_imgs = save_path.joinpath(sample + "_wsis")
         try: 
-            wsi_path = glob.glob(wsi_paths + '/' + sample + '*')[0]
+            wsi_path = glob.glob(wsi_paths + '/' + sample + '.svs')[0]
             wsi = openslide.open_slide(wsi_path)
         except:
             print('no WSI image found for sample ', sample)
             continue
         
-        print('save file exists: ', os.path.isfile(os.path.join(save_path_imgs, 'level_2', sample + '.npy')))
-        if not os.path.isfile(os.path.join(save_path_imgs, 'level_2', sample + '.npy')): 
+        print('save file exists: ', os.path.isfile(os.path.join(save_path_imgs, sample + '.ome.tif')))
+        if not os.path.isfile(os.path.join(save_path_imgs, sample + '.ome.tif')): 
             start_time = time.time()
             histoplexer_wsi.get_wsi_inference(sample, wsi, save_path_imgs)
 
@@ -130,27 +105,13 @@ if args.sample is None:
 
 else: 
     # predict for only chosen sample
-    sample = args.sample     
-    # find this sample is in which dataset     
-    if ('all' not in data_set) and ('HE_ultivue' not in data_set) and  ('external_test' not in data_set): 
-        sample_rois_test = np.array(list(set(splits['test'].dropna())))   
-        samples_test = np.array(list(set([i.split('_', 1)[0] for i in sample_rois_test]))) 
-        samples_test = np.append(samples_test, sample_rois_test)
-        
-        sample_rois_train = np.array(list(set(splits['train'].dropna()))) 
-        samples_train = np.array(list(set([i.split('_', 1)[0] for i in sample_rois_train]))) 
-        samples_train = np.append(samples_train, sample_rois_train)
-    
-        if sample in samples_test:             
-            data_set = 'test'
-        elif sample in samples_train: 
-            data_set = 'train'
-    save_path_imgs = save_path.joinpath(data_set + "_wsis")
+    sample = args.sample.split('.svs')[0]
+    save_path_imgs = save_path.joinpath(sample + "_wsis")
     
     # check if inference is already done for this sample
-    if not os.path.isfile(os.path.join(save_path_imgs, 'level_2', sample + '.npy')):
-        if (len(glob.glob(wsi_paths + '/' + sample + '*')) != 0):
-            wsi_path = glob.glob(wsi_paths + '/' + sample + '*')[0]
+    if not os.path.isfile(os.path.join(save_path_imgs, sample + '.ome.tif')):
+        if (len(glob.glob(wsi_paths + '/' + sample + '.svs')) != 0):
+            wsi_path = glob.glob(wsi_paths + '/' + sample + '.svs')[0]
             wsi = openslide.open_slide(wsi_path)
 
             start_time = time.time()

@@ -5,28 +5,25 @@ from torchvision import transforms
 from collections import OrderedDict
 import numpy as np
 import cv2
-import openslide
 from shapely.geometry import Polygon, box
 from shapely.affinity import scale
 from shapely.ops import unary_union
 from PIL import ImageDraw
-import h5py
-import gzip
-import tqdm
-import time 
 import os
 import pandas as pd
 import json
 from types import SimpleNamespace
+import tifffile
 from src.models.generator import unet_translator
 
 class HistoplexerInferenceWSI:
-    def __init__(self, checkpoint_path, seg_level, chunk_size, batch_size, n_proteins, loader_kwargs, device, normalizer):
+    def __init__(self, checkpoint_path, seg_level, chunk_size, batch_size, protein_subset, loader_kwargs, device, normalizer):
         self.checkpoint_path = checkpoint_path
         self.seg_level = seg_level
         self.chunk_size = chunk_size
         self.batch_size = batch_size
-        self.n_proteins = n_proteins
+        self.protein_subset = protein_subset
+        self.n_proteins = len(protein_subset)
         self.loader_kwargs = loader_kwargs
         self.device = device
         self.normalizer = normalizer
@@ -51,7 +48,7 @@ class HistoplexerInferenceWSI:
         print("Model created!")
 
         # load model weights all in cpu
-        self.checkpoint_name = os.path.basename(self.checkpoint_path).split('-')[1].split('.')[0]
+        self.checkpoint_name = os.path.basename(self.checkpoint_path).split('.')[0]
         print(f"Checkpoint name: {self.checkpoint_name}")
         checkpoint = torch.load(self.checkpoint_path)
         self.model.load_state_dict(checkpoint['trans_ema_state_dict']) # trans_state_dict
@@ -145,11 +142,12 @@ class HistoplexerInferenceWSI:
         downsample = 1 / slide.level_downsamples[level]
 
         draw = ImageDraw.Draw(img, 'RGBA')
-        colors = ['red', 'lightgreen']
+        colors = ['red', 'green']
         assert len(tile_sets) <= len(colors), 'define more colors'
         for tiles, color in zip(tile_sets, colors):
             for tile in tiles:
                 bbox = tuple(np.array(tile.bounds) * downsample)
+                # bbox = tuple(np.array(tile.bounds))
                 draw.rectangle(bbox, outline=color, width=line_width_pix)
 
         img = img.convert('RGB')
@@ -158,9 +156,15 @@ class HistoplexerInferenceWSI:
     def create_tissue_mask(self, wsi, min_rel_surface_area=500):
         # Determine the best level to determine the segmentation on
         level_dims = wsi.level_dimensions[self.seg_level]
+        print(f"Segmentation level: {self.seg_level}, dimensions: {level_dims}")
 
         img = np.array(wsi.read_region((0, 0), self.seg_level, level_dims))
         contours, hierarchy = self.segment_tissue(img)
+        if hierarchy is None or len(contours) == 0:
+            raise ValueError(
+                f"No contours detected at seg_level={self.seg_level}. "
+                f"Try a finer segmentation level or a different min_rel_surface_area."
+            )
         foreground_contours, hole_contours = self.detect_foreground(contours, hierarchy)
 
         # Get the total surface area of the slide level that was used
@@ -182,6 +186,7 @@ class HistoplexerInferenceWSI:
     def create_tiles_in_mask(self, wsi, tissue_mask_scaled, tile_size_pix, stride, padding=0):
         # Generate tiles covering the entire mask
         minx, miny, _, _ = tissue_mask_scaled.bounds
+        print('create_tiles_in_mask', tissue_mask_scaled.bounds, tile_size_pix, stride, padding)
 
         # Add an additional tile size to the range stop to prevent tiles being cut off at the edges.
         maxx, maxy = wsi.level_dimensions[0]
@@ -201,6 +206,8 @@ class HistoplexerInferenceWSI:
                 # Retain only the tiles that partially overlap with the tissue mask.
                 if tissue_mask_scaled.intersects(rect):
                     rects.append(rect)
+                    # print(f'input of box:', x-padding, y-padding, x+tile_size_pix+padding, y+tile_size_pix+padding)
+                    # print(f'shape of rect: {rect.bounds}, area of rect: {rect.area}')
 
         return rects
 
@@ -227,14 +234,43 @@ class HistoplexerInferenceWSI:
             os.makedirs(path)
 
     def get_chunks(self, wsi):
-        tissue_mask = self.create_tissue_mask(wsi, self.seg_level)
-        chunks = self.create_tiles_in_mask(
-            wsi,
-            tissue_mask,
-            tile_size_pix=self.chunk_size,
-            stride=self.chunk_size,
-        )
-        return tissue_mask, chunks
+        last_exc = None
+        min_rel_surface_area_candidates = [500, 1000, 2000]
+        print('chunk_size: ', self.chunk_size)
+
+        for min_rel_surface_area in min_rel_surface_area_candidates:
+            try:
+                tissue_mask = self.create_tissue_mask(
+                    wsi, min_rel_surface_area=min_rel_surface_area
+                )
+                # print(f'chunk size after tissue mask creation: {self.chunk_size}')
+                chunks = self.create_tiles_in_mask(
+                    wsi,
+                    tissue_mask,
+                    tile_size_pix=self.chunk_size,
+                    stride=self.chunk_size,
+                )
+                if len(chunks) == 0:
+                    raise ValueError(
+                        f"No tiles found at seg_level={self.seg_level}, "
+                        f"min_rel_surface_area={min_rel_surface_area}."
+                    )
+                print(
+                    f"Tissue mask created with seg_level={self.seg_level}, "
+                    f"min_rel_surface_area={min_rel_surface_area}, chunks={len(chunks)}",
+                    f"first chunk bounds: {chunks[0].bounds if len(chunks) > 0 else 'N/A'}"
+                )
+                return tissue_mask, chunks
+            except Exception as exc:
+                last_exc = exc
+                print(
+                    f"Tissue mask attempt failed at seg_level={self.seg_level}, "
+                    f"min_rel_surface_area={min_rel_surface_area}: {exc}"
+                )
+
+        raise RuntimeError(
+            "Unable to create a valid tissue mask after trying multiple min_rel_surface_area values."
+        ) from last_exc
 
     def get_qc_img(self, wsi, chunks):
         qc_img = self.make_tile_QC_fig([chunks], wsi, self.seg_level, 1)
@@ -253,71 +289,184 @@ class HistoplexerInferenceWSI:
         self.create_dir(path_qc)
         qc_img.save(path_qc.joinpath(sample + '_tile_QC.png'))
 
+    def _get_nearest_level_for_downsample(self, wsi, target_downsample):
+        """Return the pyramid level with downsample closest to target_downsample."""
+        level_downsamples = np.array(wsi.level_downsamples, dtype=np.float64)
+        return int(np.argmin(np.abs(level_downsamples - target_downsample)))
+
+    def _resize_prediction_hwc(self, pred_hwc, target_width, target_height):
+        """Resize an HWC prediction map to a target slide level size."""
+        src_h, src_w = pred_hwc.shape[:2]
+        target_width = int(target_width)
+        target_height = int(target_height)
+
+        if src_w == target_width and src_h == target_height:
+            return pred_hwc.astype(np.float32, copy=False)
+
+        if target_width < src_w or target_height < src_h:
+            interpolation = cv2.INTER_AREA
+        else:
+            interpolation = cv2.INTER_LINEAR
+
+        resized = cv2.resize(
+            pred_hwc,
+            (target_width, target_height),
+            interpolation=interpolation,
+        )
+
+        if resized.ndim == 2:
+            resized = resized[..., np.newaxis]
+
+        return resized.astype(np.float32, copy=False)
+
     def get_wsi_inference(self, sample, wsi, save_path_imgs):
         # imc multiplex to be generated at 3 downsamples
-        print(wsi.level_downsamples)
-        print(wsi.level_dimensions)
-        self.seg_level = wsi.get_best_level_for_downsample(64)
+        print('wsi.level_downsamples:', wsi.level_downsamples)
+        print('wsi.level_dimensions:', wsi.level_dimensions)
+        # self.seg_level = wsi.get_best_level_for_downsample(64)
 
-        if 'TCGA' in sample: 
-            level =  wsi.get_best_level_for_downsample(4.01)
-        else: 
-            level =  wsi.get_best_level_for_downsample(4)
+        # if 'TCGA' in sample:
+        #     inference_downsample_target = 4.01
+        # else:
+        #     inference_downsample_target = 4.0
 
-        level_dims = wsi.level_dimensions[level]
-        print(level, level_dims)
-        
-        imc_pred_level2 = np.zeros((level_dims[1],level_dims[0], self.n_proteins), dtype=np.float32)
-        imc_pred_level4 = np.zeros((int(level_dims[1]//(2**2)),int(level_dims[0]//(2**2)), self.n_proteins), dtype=np.float32)
-        imc_pred_level6 = np.zeros((int(level_dims[1]//(2**4)),int(level_dims[0]//(2**4)), self.n_proteins), dtype=np.float32)
+        # Using nearest level avoids falling back to level 0 when level-1 downsample is ~4.00x.
+        # level = self._get_nearest_level_for_downsample(wsi, inference_downsample_target)
+        print(f"selected segmentation level: {self.seg_level}, downsample: {wsi.level_downsamples[self.seg_level]}, segmentation level dims: {wsi.level_dimensions[self.seg_level]}")
 
-        print(imc_pred_level2.shape, imc_pred_level4.shape, imc_pred_level6.shape)
+        top_level_dims = wsi.level_dimensions[0]
 
-        tissue_mask, chunks = self.get_chunks(wsi) # get chunks
+        # There is a 4x downsample due to U-Net architecture, which has 7 levels of downsampling and 5 levels of upsampling
+        # so top-level predictions are at 4x downsample, and we will resize to other levels from there.
+        imc_pred_4x_downsample = np.zeros((top_level_dims[1] // 4, top_level_dims[0] // 4, self.n_proteins), dtype=np.float32)
+        imc_pred_16x_downsample = np.zeros((top_level_dims[1] // 16 ,top_level_dims[0] // 16, self.n_proteins), dtype=np.float32)
+        imc_pred_64x_downsample = np.zeros((top_level_dims[1] // 64 ,top_level_dims[0] // 64, self.n_proteins), dtype=np.float32)
+
+        _, chunks = self.get_chunks(wsi) # get chunks
         qc_img = self.get_qc_img(wsi, chunks) # get wsi with tiling for qc 
         
         # saving coordinates of tiles
         self.save_qc_and_coords(sample, chunks, qc_img, save_path_imgs)
         print(len(chunks))
 
+        loader_kwargs = dict(self.loader_kwargs) if self.loader_kwargs is not None else {}
+
         loader = DataLoader(
             dataset=BagOfTiles(wsi, chunks, self.normalizer),
             batch_size=self.batch_size,
-            **self.loader_kwargs,
+            **loader_kwargs,
         )
+        print('dataloader size:', len(loader))
 
         for batch_id, (batch, coord) in enumerate(loader):
             # predict for batch 
             with torch.no_grad():
                 # batch = (batch/255.0).to(dev0)
                 batch = batch.to(self.device)
-                print(batch_id, batch.shape, batch[0,0,0,5])
+                print(batch_id, batch.shape)
                 imc_batch = self.model(batch)
+                for i, imc in enumerate(imc_batch):
+                    print(i, imc.shape)
+                # shapes of imc_batch list: (batch_size, 11, 16, 16), (batch_size, 11, 64, 64), (batch_size, 11, 256, 256)
+                # Input is (batch_size, 3, 1024, 1024), so 4x downsampling
 
             coord = (coord.detach().cpu().numpy())#.astype(int)
             for i, c in enumerate(coord):
                 if any(x<0 for x in c) == True:
                     pass
                 else:
-                    c_6 = c//(2**6)
-                    c_4 = c//(2**4)
-                    c_2 = c//(2**2)
-                    imc_pred_level6[c_6[1]: c_6[3], c_6[0]: c_6[2], :] = (torch.permute(imc_batch[0][i], (1, 2, 0))).detach().cpu().numpy()
-                    imc_pred_level4[c_4[1]: c_4[3], c_4[0]: c_4[2], :] = (torch.permute(imc_batch[1][i], (1, 2, 0))).detach().cpu().numpy()
-                    imc_pred_level2[c_2[1]: c_2[3], c_2[0]: c_2[2], :] = (torch.permute(imc_batch[2][i], (1, 2, 0))).detach().cpu().numpy()
-                        
-        # save the generated multiplex 
-        path_level6 = save_path_imgs.joinpath('level_6')
-        path_level4 = save_path_imgs.joinpath('level_4')
-        path_level2 = save_path_imgs.joinpath('level_2')
+                    # print(f'coord of tile {i}: ', c, 'imc_batch[2][i].shape: ', imc_batch[2][i].shape)
+                    c = c // 4 # to match the 4x downsampled prediction map
+                    imc_pred_4x_downsample[c[1]:c[3], c[0]:c[2], :] = (torch.permute(imc_batch[2][i], (1, 2, 0))).detach().cpu().numpy()
+                    c = c // 4 # to match the 16x downsampled prediction map
+                    imc_pred_16x_downsample[c[1]:c[3], c[0]:c[2], :] = (torch.permute(imc_batch[1][i], (1, 2, 0))).detach().cpu().numpy()
+                    c = c // 4 # to match the 64x downsampled prediction map
+                    imc_pred_64x_downsample[c[1]:c[3], c[0]:c[2], :] = (torch.permute(imc_batch[0][i], (1, 2, 0))).detach().cpu().numpy()
 
-        self.create_dir(path_level6)
-        self.create_dir(path_level4)
-        self.create_dir(path_level2)
         
-        np.save(path_level6.joinpath(sample + '.npy'), imc_pred_level6)    
-        np.save(path_level4.joinpath(sample + '.npy'), imc_pred_level4)    
-        np.save(path_level2.joinpath(sample + '.npy'), imc_pred_level2)
+        print('top level (4x downsample):', imc_pred_4x_downsample.shape)
+        print('16x downsample:', imc_pred_16x_downsample.shape)
+        print('64x downsample:', imc_pred_64x_downsample.shape)
+
+        # Save predictions for every native slide pyramid level.
+        # We stitch at the selected inference level and then resize to each level dimension.
+        # path_all_levels = save_path_imgs.joinpath('all_levels')
+        # self.create_dir(path_all_levels)
+
+        tiff_output_path = save_path_imgs.joinpath(sample + '.ome.tif')
+        n_subifds = max(0, len(wsi.level_dimensions) - 1)
+
+        with tifffile.TiffWriter(tiff_output_path, bigtiff=True, ome=True) as tif:
+            # for level_idx in range(level, len(wsi.level_dimensions)):
+            #     if level_idx == level:
+            #         cyx_level_i = hwc_to_cyx(imc_pred_4x_downsample)
+            #         tif.write(
+            #             cyx_level_i,
+            #             metadata={
+            #                 "axes": "CYX",
+            #                 "Channel": {"Name": self.protein_subset},
+            #             },
+            #             subifds=n_subifds,
+            #             compression="zlib",
+            #         )
+            #     else:
+            #         downsample_factor = wsi.level_downsamples[level_idx] / wsi.level_downsamples[level]
+            #         if abs(downsample_factor - 4.0) < 0.05:
+            #             imc_pred_level_i = imc_pred_16x_downsample
+            #         elif abs(downsample_factor - 16.0) < 0.05:
+            #             imc_pred_level_i = imc_pred_64x_downsample
+            #         else:
+            #             level_dims_i = wsi.level_dimensions[level_idx]
+            #             imc_pred_level_i = self._resize_prediction_hwc(
+            #                 imc_pred_4x_downsample,
+            #                 target_width=level_dims_i[0],
+            #                 target_height=level_dims_i[1],
+            #             )
+            #         cyx_level_i = hwc_to_cyx(imc_pred_level_i)
+            #         # np.save(
+            #         #     path_all_levels.joinpath(sample + f'.level_{level_idx}.npy'),
+            #         #     pred_level_i,
+            #         # )
+            #         tif.write(
+            #             cyx_level_i,
+            #             subfiletype=1,
+            #             metadata={"axes": "CYX"},
+            #             compression="zlib",
+            #         )
+            # write the 4x downsampled prediction map as the main image
+            cyx_level_0 = hwc_to_cyx(imc_pred_4x_downsample)
+            tif.write(
+                cyx_level_0,
+                metadata={
+                    "axes": "CYX",
+                    "Channel": {"Name": self.protein_subset},
+                },
+                subifds=n_subifds,
+                compression="zlib",
+            )
+            cyx_level_1 = hwc_to_cyx(imc_pred_16x_downsample)
+            tif.write(
+                cyx_level_1,
+                subfiletype=1,
+                metadata={"axes": "CYX"},
+                compression="zlib",
+            )
+            cyx_level_2 = hwc_to_cyx(imc_pred_64x_downsample)
+            tif.write(
+                cyx_level_2,
+                subfiletype=1,
+                metadata={"axes": "CYX"},
+                compression="zlib",
+            )
+
+        print(f"Saved: {tiff_output_path}")
+
+
+def hwc_to_cyx(arr):
+    if arr.ndim != 3:
+        raise ValueError(f"Expected HWC array, got shape {arr.shape}")
+    return np.moveaxis(arr, -1, 0).astype(np.float32, copy=False)
+
 
 class BagOfTiles(Dataset):
     def __init__(self, wsi, tiles, normalizer=None):

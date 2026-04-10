@@ -13,3 +13,5 @@ After tissue mask is created and scaled, image tiles (called "chunks") that over
 A QC image is drawn to show selected image tiles overlapped with the WSI.
 
 The selected image tiles are then passed through the model. For each batch, the model outputs a `list` of 3 tensors at 4x, 16x, and 64x downsampling (relative to highest WSI resolution).
+
+At current setting (2 workers for dataloader, batch size = 128, image size = (48k, 30k)), it takes about 10 GB of system RAM and 14 GB of VRAM. Inference for one WSI takes about 32 seconds.
